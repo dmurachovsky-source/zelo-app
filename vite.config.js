@@ -7,7 +7,7 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: "autoUpdate",
-      includeAssets: ["icon-192.png", "icon-512.png"],
+      includeAssets: ["icon-192.png", "icon-512.png", "sw-notifications.js"],
       manifest: {
         name: "Zelo",
         short_name: "Zelo",
@@ -24,6 +24,8 @@ export default defineConfig({
         ],
       },
       workbox: {
+        // Botões "Concluir"/"Fechar" das notificações
+        importScripts: ["sw-notifications.js"],
         globPatterns: ["**/*.{js,css,html,ico,png,svg}"],
       },
     }),
