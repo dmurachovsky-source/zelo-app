@@ -8,6 +8,11 @@ import {
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, CartesianGrid
 } from "recharts";
+import {
+  isGoogleConnected, wasGoogleConnected, connectGoogle, disconnectGoogle, subscribeGoogle,
+  getClientId, hasLocalClientId, setClientId, gcalAccount, gcalListEvents, gcalInsert, gcalDelete,
+} from "./gcal.js";
+import { CADENCE_TEXT, latestSlot, upcomingSlots, showNativeAlert } from "./alerts.js";
 
 const COLORS = {
   bg: "#EDE6DA",
@@ -320,6 +325,31 @@ export default function App() {
     typeof Notification !== "undefined" ? Notification.permission : "unsupported"
   );
   const loaded = useRef(false);
+  const [alertQueue, setAlertQueue] = useState([]);
+  const [gConnected, setGConnected] = useState(isGoogleConnected());
+  const [relayKick, setRelayKick] = useState(0);
+  const relayBusy = useRef(false);
+  const relayAgain = useRef(false);
+  const doneParamHandled = useRef(false);
+
+  // Conclui uma tarefa/rotina vinda de um alerta (botão "Concluir" / "Feito")
+  const completeItem = (kind, id) => {
+    setData((prev) => {
+      if (!prev) return prev;
+      const c = structuredClone(prev);
+      if (kind === "task") {
+        const t = c.tasks.find((x) => x.id === id);
+        if (t) { t.done = true; t.lastAlertSlot = Date.now(); }
+      } else {
+        const r = c.routines.find((x) => x.id === id);
+        const iso = todayISO();
+        if (r && !r.completedDates.includes(iso)) r.completedDates.push(iso);
+      }
+      return c;
+    });
+    setAlertQueue((q) => q.filter((a) => !(a.kind === kind && a.id === id)));
+  };
+  const dismissAlert = (kind, id) => setAlertQueue((q) => q.filter((a) => !(a.kind === kind && a.id === id)));
 
   useEffect(() => {
     (async () => {
@@ -358,56 +388,147 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Fire an hourly nudge (in-app state + browser notification when allowed) for tasks marked remindHourly
+  // Mantém o estado "Google conectado" em dia (login novo, desconectou, sessão expirou)
+  useEffect(() => {
+    const sync = () => setGConnected(isGoogleConnected());
+    return subscribeGoogle(sync);
+  }, []);
+  useEffect(() => { setGConnected(isGoogleConnected()); }, [nowTick]);
+
+  // Botão "Concluir" da notificação do sistema (app já aberto em segundo plano)
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const handler = (e) => {
+      const m = e.data;
+      if (m && m.type === "zelo-done") completeItem(m.kind, m.id);
+    };
+    navigator.serviceWorker.addEventListener("message", handler);
+    return () => navigator.serviceWorker.removeEventListener("message", handler);
+  }, []);
+
+  // Botão "Concluir" da notificação com o app fechado: o Zelo abre com ?done=tipo:id
+  useEffect(() => {
+    if (loading || !data || doneParamHandled.current) return;
+    doneParamHandled.current = true;
+    const param = new URLSearchParams(window.location.search).get("done");
+    if (param && param.includes(":")) {
+      const [kind, ...rest] = param.split(":");
+      completeItem(kind, rest.join(":"));
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }, [loading, data]);
+
+  // Motor de alertas:
+  //  - tarefas: baixa 1x/dia, média a cada 4h, alta de hora em hora (até concluir)
+  //  - rotinas: na hora marcada e depois de 30 em 30 min (até confirmar "Feito")
   useEffect(() => {
     if (!data) return;
-    let changed = false;
-    const next = structuredClone(data);
+    const now = new Date(nowTick);
     const todayIso = todayISO();
-    const nowDate = new Date(nowTick);
-    next.tasks.forEach((t) => {
-      if (!t.remindHourly || t.done || !t.createdAt) return;
-      const hoursElapsed = Math.min(3, Math.floor((nowTick - t.createdAt) / 3600000));
-      const lastNotified = t.notifiedHours || 0;
-      if (hoursElapsed > lastNotified && lastNotified < 3) {
-        t.notifiedHours = hoursElapsed;
-        changed = true;
-        if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-          try {
-            new Notification("Zelo · confirma que já fez isso?", { body: `${t.text} (cobrança ${hoursElapsed}/3)` });
-          } catch (e) {
-            // notifications blocked in this environment, in-app badge still shows
-          }
-        }
+    const fresh = [];
+    const taskSlots = {};
+    const routineStates = {};
+    const prioLabel = { baixa: "baixa", media: "média", alta: "alta" };
+
+    data.tasks.forEach((t) => {
+      if (t.done) return;
+      const slot = latestSlot(t.priority, now);
+      if (!slot) return;
+      const last = t.lastAlertSlot || t.createdAt || 0;
+      if (slot.getTime() > last) {
+        taskSlots[t.id] = slot.getTime();
+        fresh.push({ kind: "task", id: t.id, title: `Tarefa · prioridade ${prioLabel[t.priority] || "média"}`, body: t.text });
       }
     });
-    // Cobrança de 30 em 30 min pras rotinas com horário, ainda não confirmadas hoje
-    next.routines.forEach((r) => {
+
+    data.routines.forEach((r) => {
       if (!r.time || r.completedDates.includes(todayIso)) return;
-      const scheduledToday = r.days && r.days.length ? r.days.includes(nowDate.getDay()) : true;
+      const scheduledToday = r.days && r.days.length ? r.days.includes(now.getDay()) : true;
       if (!scheduledToday) return;
       const [hh, mm] = r.time.split(":").map(Number);
-      const scheduled = new Date(nowDate);
+      const scheduled = new Date(now);
       scheduled.setHours(hh, mm, 0, 0);
       if (nowTick < scheduled.getTime()) return;
       const minutesLate = Math.floor((nowTick - scheduled.getTime()) / 60000);
-      const slot = Math.min(4, Math.floor(minutesLate / 30));
-      if (!r.notifyState || r.notifyState.date !== todayIso) r.notifyState = { date: todayIso, count: 0 };
-      if (slot > r.notifyState.count && r.notifyState.count < 4) {
-        r.notifyState.count = slot;
-        changed = true;
-        if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-          try {
-            new Notification("Zelo · já fez isso?", { body: `${r.text} (previsto ${r.time}, cobrança ${slot}/4)` });
-          } catch (e) {
-            // notificações bloqueadas, o selo dentro do app ainda mostra
-          }
-        }
+      const slot = Math.min(4, Math.floor(minutesLate / 30)); // 0 = chegou a hora; 1..4 = cobranças de 30 em 30 min
+      const prev = r.notifyState && r.notifyState.date === todayIso ? r.notifyState.count : -1;
+      if (slot > prev) {
+        routineStates[r.id] = { date: todayIso, count: slot };
+        fresh.push({
+          kind: "routine",
+          id: r.id,
+          title: slot === 0 ? "Rotina · está na hora" : "Rotina · já fez?",
+          body: `${r.text} (previsto ${r.time})`,
+        });
       }
     });
-    if (changed) setData(next);
+
+    if (fresh.length === 0) return;
+
+    setData((prev) => {
+      const c = structuredClone(prev);
+      c.tasks.forEach((t) => { if (taskSlots[t.id]) t.lastAlertSlot = taskSlots[t.id]; });
+      c.routines.forEach((r) => { if (routineStates[r.id]) r.notifyState = routineStates[r.id]; });
+      return c;
+    });
+    setAlertQueue((q) => [...q.filter((a) => !fresh.some((f) => f.kind === a.kind && f.id === a.id)), ...fresh]);
+    fresh.forEach((f) => showNativeAlert({ title: f.title, body: f.body, tag: `${f.kind}:${f.id}`, data: { kind: f.kind, id: f.id } }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nowTick]);
+  }, [nowTick, !!data]);
+
+  // Reserva na Agenda do Google: agenda os próximos alertas de cada tarefa (funcionam com o app fechado)
+  // e apaga os que sobraram quando a tarefa é concluída/removida/muda de prioridade.
+  const relaySig = data
+    ? data.tasks.map((t) => `${t.id}|${t.done ? 1 : 0}|${t.priority}`).join(",") + "#" + Math.floor(nowTick / 3600000) + "#" + (gConnected ? 1 : 0)
+    : "";
+  useEffect(() => {
+    if (!data || !gConnected) return;
+    if (relayBusy.current) { relayAgain.current = true; return; }
+    relayBusy.current = true;
+    (async () => {
+      const nowMs = Date.now();
+      const saveAlerts = (taskId, list) =>
+        setData((prev) => {
+          const c = structuredClone(prev);
+          const x = c.tasks.find((k) => k.id === taskId);
+          if (x) x.calAlerts = list;
+          return c;
+        });
+      try {
+        for (const t of data.tasks) {
+          const existing = (t.calAlerts || []).filter((a) => a.at > nowMs);
+          const desired = t.done ? [] : upcomingSlots(t.priority, new Date(nowMs));
+          let kept = [...existing];
+          let changed = existing.length !== (t.calAlerts || []).length;
+          try {
+            for (const a of existing.filter((x) => !desired.includes(x.at))) {
+              await gcalDelete(a.id);
+              kept = kept.filter((k) => k.id !== a.id);
+              changed = true;
+            }
+            for (const ms of desired.filter((m) => !kept.some((a) => a.at === m))) {
+              const id = await gcalInsert({
+                title: `⏰ Zelo: ${t.text}`,
+                description: `Tarefa de prioridade ${t.priority}. Abra o Zelo e toque em Concluir quando terminar.`,
+                startISO: new Date(ms).toISOString(),
+                minutes: 10,
+              });
+              kept.push({ id, at: ms });
+              changed = true;
+            }
+          } finally {
+            if (changed) saveAlerts(t.id, kept); // guarda o progresso mesmo se der erro no meio
+          }
+        }
+      } catch (e) {
+        // sessão do Google expirou ou sem internet: tenta de novo quando reconectar
+      } finally {
+        relayBusy.current = false;
+        if (relayAgain.current) { relayAgain.current = false; setRelayKick((k) => k + 1); }
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [relaySig, relayKick]);
 
   const requestNotifications = async () => {
     if (typeof Notification === "undefined") return;
@@ -523,10 +644,10 @@ export default function App() {
       return d;
     });
   };
-  const markRoutineCalendarCreated = (id) =>
+  const markRoutineCalendarCreated = (id, eventId) =>
     update((d) => {
       const r = d.routines.find((x) => x.id === id);
-      if (r) r.calendarCreated = true;
+      if (r) { r.calendarCreated = true; if (eventId) r.calEventId = eventId; }
       return d;
     });
   const saveExternalEvents = (events) =>
@@ -543,12 +664,17 @@ export default function App() {
       else r.completedDates.push(today);
       return d;
     });
+    setAlertQueue((q) => q.filter((a) => !(a.kind === "routine" && a.id === id)));
   };
-  const deleteRoutine = (id) =>
+  const deleteRoutine = (id) => {
+    const r = data.routines.find((x) => x.id === id);
+    if (r && r.calEventId && isGoogleConnected()) gcalDelete(r.calEventId).catch(() => {});
+    setAlertQueue((q) => q.filter((a) => !(a.kind === "routine" && a.id === id)));
     update((d) => {
       d.routines = d.routines.filter((x) => x.id !== id);
       return d;
     });
+  };
 
   const addTask = (text, dueDate, dueTime, priority, remindHourly) => {
     if (!text.trim()) return;
@@ -560,38 +686,40 @@ export default function App() {
         dueTime: dueTime || null,
         priority,
         done: false,
-        remindHourly: !!remindHourly,
+        remindHourly: true,
         createdAt: Date.now(),
-        notifiedHours: 0,
-        calendarCreated: false,
+        calAlerts: [],
         deadlineCalendarCreated: false,
       });
       return d;
     });
   };
-  const markCalendarCreated = (id) =>
-    update((d) => {
-      const t = d.tasks.find((x) => x.id === id);
-      if (t) t.calendarCreated = true;
-      return d;
-    });
   const markDeadlineCreated = (id) =>
     update((d) => {
       const t = d.tasks.find((x) => x.id === id);
       if (t) t.deadlineCalendarCreated = true;
       return d;
     });
-  const toggleTask = (id) =>
+  const toggleTask = (id) => {
     update((d) => {
       const t = d.tasks.find((x) => x.id === id);
       t.done = !t.done;
+      t.lastAlertSlot = Date.now();
       return d;
     });
-  const deleteTask = (id) =>
+    setAlertQueue((q) => q.filter((a) => !(a.kind === "task" && a.id === id)));
+  };
+  const deleteTask = (id) => {
+    const t = data.tasks.find((x) => x.id === id);
+    if (t && t.calAlerts && t.calAlerts.length && isGoogleConnected()) {
+      t.calAlerts.forEach((a) => { gcalDelete(a.id).catch(() => {}); });
+    }
+    setAlertQueue((q) => q.filter((a) => !(a.kind === "task" && a.id === id)));
     update((d) => {
       d.tasks = d.tasks.filter((x) => x.id !== id);
       return d;
     });
+  };
 
   const addEntry = (desc, value, type, category) => {
     if (!desc.trim() || !value) return;
@@ -823,7 +951,7 @@ export default function App() {
 
       {/* Status de conexões */}
       <div className="mb-6">
-        <ConnectionStatus externalEvents={data.externalEvents} syncedAt={data.externalEventsSyncedAt} onSync={saveExternalEvents} />
+        <ConnectionStatus externalEvents={data.externalEvents} syncedAt={data.externalEventsSyncedAt} onSync={saveExternalEvents} gConnected={gConnected} notifPermission={notifPermission} onRequestNotifications={requestNotifications} />
       </div>
 
       {/* Calendário da semana — página inicial */}
@@ -944,7 +1072,7 @@ export default function App() {
                       time={r.time}
                       days={r.days}
                       alreadyCreated={!!r.calendarCreated}
-                      onDone={() => markRoutineCalendarCreated(r.id)}
+                      onDone={(eventId) => markRoutineCalendarCreated(r.id, eventId)}
                     />
                     <IconBtn onClick={() => deleteRoutine(r.id)} title="Remover" danger>
                       <Trash2 size={15} />
@@ -973,7 +1101,7 @@ export default function App() {
               style={{ background: COLORS.sageBg, color: COLORS.sageDark, border: `1px solid ${COLORS.sage}55` }}
               className="flex items-center gap-2 text-xs px-3 py-2 rounded-lg mt-3"
             >
-              <BellRing size={13} /> Ativar notificações do navegador para as cobranças de hora em hora
+              <BellRing size={13} /> Ativar notificações com botões Concluir / Fechar
             </button>
           )}
 
@@ -988,10 +1116,7 @@ export default function App() {
               .map((t) => {
                 const overdue = !t.done && t.dueDate && t.dueDate < today;
                 const p = PRIORITIES[t.priority] || PRIORITIES.baixa;
-                const hoursNagging = t.remindHourly && !t.done && t.createdAt
-                  ? Math.floor((nowTick - t.createdAt) / 3600000)
-                  : 0;
-                const naggingTone = hoursNagging >= 3 ? "danger" : hoursNagging >= 1 ? "butter" : "sage";
+                const cadence = CADENCE_TEXT[t.priority] || CADENCE_TEXT.media;
                 return (
                   <div
                     key={t.id}
@@ -1018,24 +1143,18 @@ export default function App() {
                         )}
                       </span>
                     </button>
-                    {t.remindHourly && !t.done && (
-                      <span
-                        style={{
-                          background: naggingTone === "danger" ? COLORS.dangerBg : naggingTone === "butter" ? COLORS.butterBg : COLORS.sageBg,
-                          color: naggingTone === "danger" ? COLORS.danger : naggingTone === "butter" ? COLORS.butterDark : COLORS.sageDark,
-                        }}
-                        className={`flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full whitespace-nowrap ${naggingTone === "danger" ? "animate-pulse" : ""}`}
-                      >
-                        <Clock size={11} /> {hoursNagging === 0 ? "cobrando" : `${hoursNagging}h cobrando`}
+                    {!t.done && t.calAlerts && t.calAlerts.length > 0 && (
+                      <span className="flex items-center gap-1 text-xs whitespace-nowrap" style={{ color: COLORS.sageDark }} title="Alertas já agendados no Google Agenda">
+                        <CalendarClock size={12} /> {t.calAlerts.length} na agenda
                       </span>
                     )}
-                    {t.remindHourly && !t.done && <CalendarReminderButton taskText={t.text} alreadyCreated={!!t.calendarCreated} onDone={() => markCalendarCreated(t.id)} />}
                     {t.dueDate && !t.done && <DeadlineReminderButton taskText={t.text} dueDate={t.dueDate} alreadyCreated={!!t.deadlineCalendarCreated} onDone={() => markDeadlineCreated(t.id)} />}
                     <span
                       style={{ background: p.bg, color: p.color }}
                       className="text-xs font-medium px-2 py-0.5 rounded-full whitespace-nowrap"
+                      title={`Alerta ${cadence}`}
                     >
-                      {p.label}
+                      {p.label} · {cadence}
                     </span>
                     <IconBtn onClick={() => deleteTask(t.id)} title="Remover" danger>
                       <Trash2 size={15} />
@@ -1366,76 +1485,34 @@ export default function App() {
         </SectionCard>
       )}
 
+      <AlertCenter queue={alertQueue} onDone={completeItem} onClose={dismissAlert} />
       <VoiceFab categories={categories} addEntry={addEntry} addCategory={addCategory} addTask={addTask} saveNote={saveNote} />
     </div>
   );
 }
 
 async function fetchGoogleEvents() {
-  const prompt = `Liste os eventos do Google Agenda do usuário dos próximos 14 dias. Responda APENAS com JSON, sem markdown: {"events": [{"title": "nome do evento", "date": "AAAA-MM-DD", "time": "HH:MM ou null se for dia inteiro"}]}. Se não conseguir acessar a agenda, responda {"events": []}.`;
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      messages: [{ role: "user", content: prompt }],
-      mcp_servers: [{ type: "url", url: "https://calendarmcp.googleapis.com/mcp/v1", name: "google-calendar" }],
-    }),
-  });
-  const json = await response.json();
-  const raw = (json.content || []).map((b) => b.text || "").join("");
-  const clean = raw.replace(/```json|```/g, "").trim();
-  const parsed = JSON.parse(clean);
-  return parsed.events || [];
+  if (!isGoogleConnected()) await connectGoogle();
+  return gcalListEvents(14);
 }
 
-async function checkConnection(mcpUrl, mcpName, prompt) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      messages: [{ role: "user", content: prompt }],
-      mcp_servers: [{ type: "url", url: mcpUrl, name: mcpName }],
-    }),
-  });
-  const json = await response.json();
-  const raw = (json.content || []).map((b) => b.text || "").join("");
-  const usedTool = (json.content || []).some((b) => b.type === "mcp_tool_result" || b.type === "mcp_tool_use");
-  const hasAuthError = (json.content || []).some(
-    (b) => b.type === "mcp_tool_result" && JSON.stringify(b).toLowerCase().match(/unauthor|not.?connect|auth/)
-  );
-  let account = null;
-  try {
-    const clean = raw.replace(/```json|```/g, "").trim();
-    const parsed = JSON.parse(clean);
-    account = parsed.account || null;
-  } catch (e) {
-    // sem JSON válido, segue sem conta identificada
-  }
-  if (hasAuthError) return { status: "disconnected", account: null };
-  if (account) return { status: "connected", account };
-  if (usedTool) return { status: "connected", account: null };
-  return { status: "disconnected", account: null };
+function friendlyGoogleError(e) {
+  const m = String((e && e.message) || e || "");
+  if (m === "NO_CLIENT_ID") return "Falta colar o Client ID do Google (passo a passo no chat).";
+  if (m.includes("popup_closed") || m.includes("popup_failed")) return "A janela do Google foi fechada ou bloqueada. Toque em Conectar de novo e permita o pop-up.";
+  if (m.includes("access_denied")) return "Acesso negado. Confira se o seu e-mail foi adicionado como usuário de teste no Google Cloud.";
+  if (m.includes("redirect_uri") || m.includes("origin")) return "O endereço do app não está liberado no Google Cloud (Origens JavaScript autorizadas).";
+  return m || "Não consegui conectar agora.";
 }
 
-function ConnectionRow({ label, icon: Icon, state, onRetry }) {
+function ConnectionRow({ label, icon: Icon, tone, text, children }) {
   const colors = {
     idle: { bg: COLORS.cardAlt, fg: COLORS.inkSoft },
-    checking: { bg: COLORS.cardAlt, fg: COLORS.inkSoft },
     connected: { bg: COLORS.sageBg, fg: COLORS.sageDark },
     disconnected: { bg: COLORS.dangerBg, fg: COLORS.danger },
-    error: { bg: COLORS.butterBg, fg: COLORS.butterDark },
+    warn: { bg: COLORS.butterBg, fg: COLORS.butterDark },
   };
-  const c = colors[state.status] || colors.idle;
-  const text =
-    state.status === "checking" ? "verificando..." :
-    state.status === "connected" ? (state.account ? state.account : "conectado") :
-    state.status === "disconnected" ? "não conectado" :
-    state.status === "error" ? "não consegui verificar" : "toque pra verificar";
-
+  const c = colors[tone] || colors.idle;
   return (
     <div style={{ background: c.bg }} className="flex items-center gap-2.5 rounded-lg px-3 py-2.5">
       <Icon size={16} style={{ color: c.fg, flexShrink: 0 }} />
@@ -1443,86 +1520,143 @@ function ConnectionRow({ label, icon: Icon, state, onRetry }) {
         <p className="text-xs font-semibold" style={{ color: c.fg }}>{label}</p>
         <p className="text-xs truncate" style={{ color: c.fg }}>{text}</p>
       </div>
-      {state.status === "checking" ? (
-        <Loader2 size={14} className="animate-spin" style={{ color: c.fg }} />
-      ) : (
-        <button onClick={onRetry} title="Verificar de novo" style={{ color: c.fg }} className="p-1 rounded-md hover:bg-black/5 shrink-0">
-          <RefreshCw size={13} />
-        </button>
-      )}
+      {children}
     </div>
   );
 }
 
-function ConnectionStatus({ externalEvents, syncedAt, onSync }) {
-  const [google, setGoogle] = useState({ status: "idle", account: null });
-  const [ms, setMs] = useState({ status: "idle", account: null });
+function GoogleRow({ connected }) {
+  const [clientId, setClientIdState] = useState(getClientId());
+  const [draft, setDraft] = useState("");
+  const [account, setAccount] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const loadAccount = async () => {
+    try {
+      const info = await gcalAccount();
+      setAccount(info.account);
+    } catch (e) {
+      setAccount(null);
+    }
+  };
+  useEffect(() => {
+    if (connected) loadAccount();
+    else setAccount(null);
+  }, [connected]);
+
+  const connect = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await connectGoogle();
+    } catch (e) {
+      setError(friendlyGoogleError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const saveClient = () => {
+    setClientId(draft);
+    setClientIdState(getClientId());
+    setDraft("");
+  };
+
+  const hasClient = !!clientId;
+  const tone = connected ? "connected" : hasClient && wasGoogleConnected() ? "warn" : "disconnected";
+  const text = connected
+    ? account || "conectado"
+    : !hasClient
+    ? "falta configurar (Client ID do Google)"
+    : wasGoogleConnected()
+    ? "sessão expirou — toque em Conectar"
+    : "não conectado";
+
+  return (
+    <>
+      <ConnectionRow label="Google Agenda" icon={CalendarClock} tone={tone} text={text}>
+        {busy ? (
+          <Loader2 size={14} className="animate-spin" />
+        ) : connected ? (
+          <div className="flex items-center gap-1 shrink-0">
+            <button onClick={loadAccount} title="Verificar de novo" className="p-1 rounded-md hover:bg-black/5"><RefreshCw size={13} /></button>
+            <button onClick={() => disconnectGoogle()} title="Desconectar" className="p-1 rounded-md hover:bg-black/5"><X size={13} /></button>
+          </div>
+        ) : hasClient ? (
+          <button onClick={connect} style={{ background: COLORS.sage, color: "white" }} className="text-xs font-medium px-3 py-1 rounded-full shrink-0">
+            Conectar
+          </button>
+        ) : null}
+      </ConnectionRow>
+      {!hasClient && (
+        <div className="flex gap-2">
+          <TextInput value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Cole aqui o Client ID do Google (termina em .apps.googleusercontent.com)" />
+          <button onClick={saveClient} style={{ background: COLORS.ink, color: COLORS.card }} className="rounded-lg px-3 text-xs shrink-0">Salvar</button>
+        </div>
+      )}
+      {hasClient && !connected && hasLocalClientId() && (
+        <button
+          onClick={() => { setClientId(""); setClientIdState(""); }}
+          className="text-[11px] underline self-start"
+          style={{ color: COLORS.inkSoft }}
+        >
+          trocar o Client ID
+        </button>
+      )}
+      {error && <p className="text-xs" style={{ color: COLORS.danger }}>{error}</p>}
+    </>
+  );
+}
+
+function ConnectionStatus({ externalEvents, syncedAt, onSync, gConnected, notifPermission, onRequestNotifications }) {
   const [syncStatus, setSyncStatus] = useState("idle"); // idle|loading|error
-
-  const checkGoogle = async () => {
-    setGoogle({ status: "checking", account: null });
-    try {
-      const result = await checkConnection(
-        "https://calendarmcp.googleapis.com/mcp/v1",
-        "google-calendar",
-        `Liste os calendários do usuário. Responda APENAS com JSON, sem markdown: {"account": "e-mail ou nome do calendário principal"}.`
-      );
-      setGoogle(result);
-    } catch (e) {
-      setGoogle({ status: "error", account: null });
-    }
-  };
-
-  const checkMs = async () => {
-    setMs({ status: "checking", account: null });
-    try {
-      const result = await checkConnection(
-        "https://microsoft365.mcp.claude.com/mcp",
-        "microsoft-365",
-        `Identifique a conta Microsoft/Outlook conectada do usuário (use qualquer ferramenta disponível de perfil, e-mail ou agenda). Responda APENAS com JSON, sem markdown: {"account": "e-mail ou nome da conta"}.`
-      );
-      setMs(result);
-    } catch (e) {
-      setMs({ status: "error", account: null });
-    }
-  };
+  const [syncError, setSyncError] = useState("");
 
   const syncEvents = async () => {
     setSyncStatus("loading");
+    setSyncError("");
     try {
       const events = await fetchGoogleEvents();
       onSync(events);
       setSyncStatus("idle");
     } catch (e) {
+      setSyncError(friendlyGoogleError(e));
       setSyncStatus("error");
     }
   };
 
-  // Verificação manual — evita pedir acesso à agenda toda vez que o Zelo abre
+  const notifTone = notifPermission === "granted" ? "connected" : notifPermission === "denied" ? "disconnected" : "warn";
+  const notifText =
+    notifPermission === "granted" ? "ativadas (com botões Concluir / Fechar)" :
+    notifPermission === "denied" ? "bloqueadas — libere nas configurações do navegador" :
+    notifPermission === "unsupported" ? "este navegador não suporta" : "desativadas";
 
   return (
     <SectionCard>
       <div className="flex items-center justify-between mb-3">
         <h3 className="zelo-display text-lg">Conexões</h3>
-        <p className="text-xs" style={{ color: COLORS.inkSoft }}>agenda em tempo real</p>
+        <p className="text-xs" style={{ color: COLORS.inkSoft }}>agenda e alertas</p>
       </div>
       <div className="flex flex-col gap-2">
-        <ConnectionRow label="Google Agenda" icon={CalendarClock} state={google} onRetry={checkGoogle} />
-        <ConnectionRow label="Microsoft / Outlook" icon={CalendarClock} state={ms} onRetry={checkMs} />
+        <GoogleRow connected={gConnected} />
+        <ConnectionRow label="Microsoft / Outlook" icon={CalendarClock} tone="idle" text="em breve — precisa de uma configuração própria (Azure)" />
+        <ConnectionRow label="Notificações do aparelho" icon={BellRing} tone={notifTone} text={notifText}>
+          {notifPermission !== "granted" && notifPermission !== "denied" && notifPermission !== "unsupported" && (
+            <button onClick={onRequestNotifications} style={{ background: COLORS.sage, color: "white" }} className="text-xs font-medium px-3 py-1 rounded-full shrink-0">
+              Ativar
+            </button>
+          )}
+        </ConnectionRow>
       </div>
       <p className="text-xs mt-3" style={{ color: COLORS.inkSoft }}>
-        A verificação é sob demanda (toque no ↻) — assim o Zelo não fica pedindo acesso à agenda toda vez que você abre o app.
+        O Zelo só pede acesso à sua Agenda quando você toca em Conectar — nunca sozinho ao abrir o app.
+        Com o Google conectado, os alertas das tarefas também ficam agendados na Agenda e tocam mesmo com o app fechado.
       </p>
-      {(google.status === "disconnected" || ms.status === "disconnected") && (
-        <p className="text-xs mt-1" style={{ color: COLORS.inkSoft }}>
-          Pra conectar ou trocar de conta, é pelo menu de conectores do Claude (fora do Zelo) — não tem como fazer isso daqui de dentro.
-        </p>
-      )}
 
       <div style={{ borderTop: `1px solid ${COLORS.line}` }} className="pt-3 mt-3">
         <div className="flex items-center justify-between mb-2">
           <p className="text-xs font-semibold" style={{ color: COLORS.inkSoft }}>
-            Eventos já criados na sua Agenda (últimos 14 dias)
+            Eventos já criados na sua Agenda (próximos 14 dias)
           </p>
           <button
             onClick={syncEvents}
@@ -1534,9 +1668,7 @@ function ConnectionStatus({ externalEvents, syncedAt, onSync }) {
             Sincronizar
           </button>
         </div>
-        {syncStatus === "error" && (
-          <p className="text-xs" style={{ color: COLORS.danger }}>Não consegui buscar os eventos agora. Tenta de novo.</p>
-        )}
+        {syncStatus === "error" && <p className="text-xs" style={{ color: COLORS.danger }}>{syncError}</p>}
         {syncedAt && (
           <p className="text-xs mb-1.5" style={{ color: COLORS.inkSoft }}>
             Última sincronização: {new Date(syncedAt).toLocaleString("pt-BR")}
@@ -1565,33 +1697,11 @@ function ConnectionStatus({ externalEvents, syncedAt, onSync }) {
 
 async function createCalendarEvents(eventList) {
   // eventList: [{ iso, title, desc }]
-  const list = eventList
-    .map((e) => `- ${e.iso} (horário exato, ISO 8601 em UTC), duração 15 min, título "${e.title}", descrição "${e.desc}"`)
-    .join("\n");
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      messages: [{
-        role: "user",
-        content: `Crie estes eventos no Google Agenda do usuário, usando exatamente estes horários (já em UTC, converta para o fuso do calendário do usuário) e títulos:\n${list}\nDepois de criar todos, responda só "OK".`,
-      }],
-      mcp_servers: [{ type: "url", url: "https://calendarmcp.googleapis.com/mcp/v1", name: "google-calendar" }],
-    }),
-  });
-  const json = await response.json();
-  return (json.content || []).some((b) => b.type === "mcp_tool_result" || b.type === "mcp_tool_use");
-}
-
-function buildHourlyEvents(taskText, anchorDate) {
-  const now = anchorDate || new Date();
-  return [1, 2, 3].map((h) => {
-    const d = new Date(now);
-    d.setHours(d.getHours() + h);
-    return { iso: d.toISOString(), title: `Confirme: ${taskText} · Zelo`, desc: "Lembrete do Zelo para confirmar se essa tarefa foi concluída." };
-  });
+  if (!isGoogleConnected()) await connectGoogle();
+  for (const e of eventList) {
+    await gcalInsert({ title: e.title, description: e.desc, startISO: e.iso, minutes: 15 });
+  }
+  return true;
 }
 
 function buildDeadlineEvents(taskText, dueDateISO) {
@@ -1607,55 +1717,21 @@ function buildDeadlineEvents(taskText, dueDateISO) {
     }));
 }
 
-function CalendarReminderButton({ taskText, alreadyCreated, onDone }) {
-  const [status, setStatus] = useState(alreadyCreated ? "done" : "idle");
-  const create = async () => {
-    setStatus("loading");
-    try {
-      const worked = await createCalendarEvents(buildHourlyEvents(taskText));
-      setStatus(worked ? "done" : "error");
-      if (worked && onDone) onDone();
-    } catch (e) {
-      setStatus("error");
-    }
-  };
-  useEffect(() => { if (!alreadyCreated) create(); }, []);
-  if (status === "done") {
-    return (
-      <span className="flex items-center gap-1 text-xs whitespace-nowrap" style={{ color: COLORS.sageDark }}>
-        <CalendarClock size={12} /> na agenda
-      </span>
-    );
-  }
-  return (
-    <button
-      onClick={create}
-      disabled={status === "loading"}
-      title="Criar 3 lembretes no Google Agenda, um a cada hora"
-      style={{ color: COLORS.inkSoft }}
-      className="flex items-center gap-1 text-xs px-1.5 py-1 rounded-md hover:bg-black/5 disabled:opacity-60 whitespace-nowrap"
-    >
-      {status === "loading" ? <Loader2 size={12} className="animate-spin" /> : <CalendarClock size={12} />}
-      {status === "error" ? "tentar de novo" : status === "loading" ? "" : "agenda"}
-    </button>
-  );
-}
-
 function DeadlineReminderButton({ taskText, dueDate, alreadyCreated, onDone }) {
   const [status, setStatus] = useState(alreadyCreated ? "done" : "idle");
   const create = async () => {
     setStatus("loading");
     try {
       const events = buildDeadlineEvents(taskText, dueDate);
-      if (events.length === 0) { setStatus("done"); if (onDone) onDone(); return; }
-      const worked = await createCalendarEvents(events);
-      setStatus(worked ? "done" : "error");
-      if (worked && onDone) onDone();
+      if (events.length > 0) await createCalendarEvents(events);
+      setStatus("done");
+      if (onDone) onDone();
     } catch (e) {
       setStatus("error");
     }
   };
-  useEffect(() => { if (!alreadyCreated) create(); }, []);
+  // Só cria sozinho se o Google já estiver conectado; senão espera um toque (o login do Google exige um toque).
+  useEffect(() => { if (!alreadyCreated && isGoogleConnected()) create(); }, []);
   if (status === "done") {
     return (
       <span className="flex items-center gap-1 text-xs whitespace-nowrap" style={{ color: COLORS.butterDark }}>
@@ -1679,33 +1755,33 @@ function DeadlineReminderButton({ taskText, dueDate, alreadyCreated, onDone }) {
 
 const RRULE_DAY = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
 
-async function createRoutineRecurringEvent(routineText, time, days) {
-  const hm = time || "08:00";
-  const [hh, mm] = hm.split(":").map(Number);
+// Primeira ocorrência futura que cai num dos dias escolhidos
+function nextOccurrence(time, days) {
+  const [hh, mm] = (time || "08:00").split(":").map(Number);
+  const allowed = days && days.length ? days : [0, 1, 2, 3, 4, 5, 6];
   const now = new Date();
-  const start = new Date(now);
-  start.setHours(hh, mm, 0, 0);
-  if (start.getTime() < now.getTime()) start.setDate(start.getDate() + 1);
-  const byday = (days && days.length ? days : [0, 1, 2, 3, 4, 5, 6]).map((d) => RRULE_DAY[d]).join(",");
-  const daysLabel = (days && days.length && days.length < 7)
-    ? days.map((d) => WEEKDAY_LABELS[d]).join(", ")
-    : "todos os dias";
+  for (let i = 0; i < 8; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + i);
+    d.setHours(hh, mm, 0, 0);
+    if (d.getTime() > now.getTime() && allowed.includes(d.getDay())) return d;
+  }
+  return new Date(now.getTime() + 3600000);
+}
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      messages: [{
-        role: "user",
-        content: `Crie UM evento recorrente no Google Agenda do usuário. Primeira ocorrência em ${start.toISOString()} (UTC, converta pro fuso do calendário), duração 20 minutos, título "Rotina: ${routineText} · Zelo". Repita nos dias: ${daysLabel} (regra de recorrência RRULE:FREQ=WEEKLY;BYDAY=${byday}), sem data de término. Depois de criar, responda só "OK".`,
-      }],
-      mcp_servers: [{ type: "url", url: "https://calendarmcp.googleapis.com/mcp/v1", name: "google-calendar" }],
-    }),
+// Cria UM evento recorrente semanal (nos dias escolhidos). Devolve o id do evento.
+async function createRoutineRecurringEvent(routineText, time, days) {
+  if (!isGoogleConnected()) await connectGoogle();
+  const start = nextOccurrence(time, days);
+  const byday = (days && days.length ? days : [0, 1, 2, 3, 4, 5, 6]).map((d) => RRULE_DAY[d]).join(",");
+  return gcalInsert({
+    title: `Rotina: ${routineText}`,
+    description: "Rotina do Zelo. Abra o app e toque em Feito.",
+    startISO: start.toISOString(),
+    minutes: 20,
+    recurrence: [`RRULE:FREQ=WEEKLY;BYDAY=${byday}`],
+    reminderMinutes: 0,
   });
-  const json = await response.json();
-  return (json.content || []).some((b) => b.type === "mcp_tool_result" || b.type === "mcp_tool_use");
 }
 
 function RoutineCalendarButton({ routineText, time, days, alreadyCreated, onDone }) {
@@ -1713,14 +1789,14 @@ function RoutineCalendarButton({ routineText, time, days, alreadyCreated, onDone
   const create = async () => {
     setStatus("loading");
     try {
-      const worked = await createRoutineRecurringEvent(routineText, time, days);
-      setStatus(worked ? "done" : "error");
-      if (worked && onDone) onDone();
+      const eventId = await createRoutineRecurringEvent(routineText, time, days);
+      setStatus("done");
+      if (onDone) onDone(eventId);
     } catch (e) {
       setStatus("error");
     }
   };
-  useEffect(() => { if (!alreadyCreated) create(); }, []);
+  useEffect(() => { if (!alreadyCreated && isGoogleConnected()) create(); }, []);
   if (status === "done") {
     return (
       <span className="flex items-center gap-1 text-xs whitespace-nowrap" style={{ color: COLORS.sageDark }}>
@@ -1739,6 +1815,47 @@ function RoutineCalendarButton({ routineText, time, days, alreadyCreated, onDone
       {status === "loading" ? <Loader2 size={12} className="animate-spin" /> : <CalendarClock size={12} />}
       {status === "error" ? "tentar de novo" : status === "loading" ? "" : "agenda"}
     </button>
+  );
+}
+
+// Alerta na tela: um para tarefas (rosa) e outro para rotinas (verde), com Fechar / Concluir
+function AlertCenter({ queue, onDone, onClose }) {
+  if (!queue || queue.length === 0) return null;
+  const a = queue[0];
+  const isTask = a.kind === "task";
+  const accent = isTask ? COLORS.rose : COLORS.sage;
+  const accentDark = isTask ? COLORS.roseDark : COLORS.sageDark;
+  return (
+    <div style={{ position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 60, pointerEvents: "none" }} className="p-3 flex justify-center">
+      <div
+        style={{ background: COLORS.card, border: `2px solid ${accent}`, boxShadow: "0 10px 30px rgba(58,50,38,0.3)", pointerEvents: "auto" }}
+        className="w-full max-w-md rounded-2xl p-4"
+      >
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-xs font-semibold uppercase tracking-wide flex items-center gap-1.5" style={{ color: accentDark }}>
+            <BellRing size={13} /> {a.title}
+          </p>
+          {queue.length > 1 && <span className="text-xs" style={{ color: COLORS.inkSoft }}>+{queue.length - 1} aguardando</span>}
+        </div>
+        <p className="text-base font-medium mb-3" style={{ color: COLORS.ink }}>{a.body}</p>
+        <div className="flex gap-2">
+          <button
+            onClick={() => onClose(a.kind, a.id)}
+            style={{ border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft, flex: 1 }}
+            className="rounded-xl py-3 text-sm font-medium"
+          >
+            Fechar
+          </button>
+          <button
+            onClick={() => onDone(a.kind, a.id)}
+            style={{ background: COLORS.sage, color: "white", flex: 2 }}
+            className="rounded-xl py-3 text-sm font-semibold flex items-center justify-center gap-1.5"
+          >
+            <CheckCircle2 size={16} /> {isTask ? "Concluir" : "Feito"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -2435,10 +2552,9 @@ function TaskForm({ onAdd }) {
   const [due, setDue] = useState("");
   const [dueTime, setDueTime] = useState("");
   const [priority, setPriority] = useState("media");
-  const [remindHourly, setRemindHourly] = useState(false);
   const submit = () => {
-    onAdd(text, due, dueTime, priority, remindHourly);
-    setText(""); setDue(""); setDueTime(""); setPriority("media"); setRemindHourly(false);
+    onAdd(text, due, dueTime, priority, true);
+    setText(""); setDue(""); setDueTime(""); setPriority("media");
   };
   return (
     <div className="flex flex-col gap-2">
@@ -2453,10 +2569,9 @@ function TaskForm({ onAdd }) {
         </select>
         <button onClick={submit} style={{ background: COLORS.ink, color: COLORS.card }} className="rounded-lg px-3 flex items-center justify-center"><Plus size={16} /></button>
       </div>
-      <label className="flex items-center gap-2 text-xs cursor-pointer select-none" style={{ color: COLORS.inkSoft }}>
-        <input type="checkbox" checked={remindHourly} onChange={(e) => setRemindHourly(e.target.checked)} />
-        Cobrar de hora em hora até eu concluir
-      </label>
+      <p className="text-xs" style={{ color: COLORS.inkSoft }}>
+        🔔 Alertas até você concluir — baixa: {CADENCE_TEXT.baixa} (9h) · média: {CADENCE_TEXT.media} · alta: {CADENCE_TEXT.alta} (das 7h às 21h).
+      </p>
     </div>
   );
 }
